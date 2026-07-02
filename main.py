@@ -249,7 +249,7 @@ GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role
 # https://console.groq.com/settings/limits) without editing code.
 MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "10"))
 CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "160"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # If a long, multi-turn conversation still risks a large prompt, cap
 # compiled_history to the most recent turns rather than resending every
