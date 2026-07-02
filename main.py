@@ -191,10 +191,11 @@ recommendations must be [] when still gathering context or refusing, otherwise 1
 
 GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role or skills?"
 
-MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "10"))
-CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "160"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "12"))
+MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "4")) 
+CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "100"))
+MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4")) 
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
 MAX_LLM_RETRIES = 2
 RATE_LIMIT_RETRY_AFTER_GIVE_UP_S = 25
 _RETRY_AFTER_RE = re.compile(r"try again in (\d+)m|try again in ([\d.]+)s", re.IGNORECASE)
