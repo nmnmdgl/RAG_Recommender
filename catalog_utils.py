@@ -43,6 +43,7 @@ KEY_TO_LETTER = {name: letter for name, letter in CANONICAL_KEY_ORDER}
 LETTER_ORDER = ["A", "B", "C", "D", "E", "K", "P", "S"]
 
 
+
 def clean_json_text(raw_text: str) -> str:
     """Strip illegal control characters that break json.loads on this file."""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw_text)
