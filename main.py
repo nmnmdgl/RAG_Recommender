@@ -193,7 +193,7 @@ GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role
 
 MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "10"))
 CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "160"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "12"))
 MAX_LLM_RETRIES = 2
 RATE_LIMIT_RETRY_AFTER_GIVE_UP_S = 25
