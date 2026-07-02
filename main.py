@@ -1,8 +1,4 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-import torch
-torch.set_num_threads(1)
 import re
 import json
 import time
@@ -11,11 +7,8 @@ import logging
 import difflib
 import traceback
 from typing import List, Optional
-
-import faiss
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 from groq import (
     Groq,
     RateLimitError,
@@ -24,16 +17,8 @@ from groq import (
     APIConnectionError,
     APIStatusError,
 )
-
 import catalog_utils as cu
-from retrieval import HybridRetriever
 
-# Structured logging: every failure now goes to a file with a full traceback
-# AND a stage tag (retrieval / llm-call / json-parse / validation), instead of
-# a single `print(f"⚠️ Agent error: {e}")` that collapses every possible
-# failure mode into one indistinguishable console line. This is what lets you
-# tell "Groq rate-limited us" apart from "a real bug in our own code" the
-# next time something goes to zero across a run.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -45,45 +30,31 @@ app = FastAPI(title="SHL Recommender API")
 
 _groq_api_key = os.environ.get("GROQ_API_KEY")
 if not _groq_api_key:
-    # This used to fall back to "dummy_key" completely silently. That means
-    # every single call would 401 from the very first request, and the only
-    # symptom would be near-instant, empty responses -- exactly the pattern
-    # seen across C2-C9. Silently masking a missing key is itself a bug;
-    # now it's at least loud at startup.
     logger.error(
         "GROQ_API_KEY is not set in the environment. Every /chat call will "
         "fail authentication until this is fixed."
     )
 
-# timeout: bounds a single attempt so a hung call can't silently eat your
-# whole 30s eval budget without you knowing why.
-# max_retries=0: the SDK's own built-in retry-on-timeout/connection-error is
-# disabled here on purpose -- we do our own bounded retry loop below (with
-# stage-specific logging) instead of having two separate, invisible retry
-# layers stacked on top of each other.
 client = Groq(api_key=_groq_api_key or "dummy_key", timeout=20.0, max_retries=0)
 
-FAISS_INDEX_PATH = "shl_vector_index.faiss"
 METADATA_PATH = "shl_metadata_store.pkl"
 BM25_CORPUS_PATH = "shl_bm25_corpus.pkl"
 
-retriever: Optional[HybridRetriever] = None
+bm25 = None
 metadata_store = None
-# Fast exact-match lookups used by the post-generation validator.
 url_index = {}
 name_index = {}
 
 
 @app.on_event("startup")
 def startup_load_resources():
-    global retriever, metadata_store, url_index, name_index
-    print("⏳ System startup: Loading retrieval resources...")
+    global bm25, metadata_store, url_index, name_index
+    print("⏳ System startup: Loading BM25 retrieval resources (Lightweight Mode)...")
 
-    if not (os.path.exists(FAISS_INDEX_PATH) and os.path.exists(METADATA_PATH)):
-        print("⚠️ Warning: Index files missing. Run build_index.py first.")
+    if not os.path.exists(METADATA_PATH):
+        print("⚠️ Warning: Metadata file missing. Run build_index.py first.")
         return
 
-    vector_index = faiss.read_index(FAISS_INDEX_PATH)
     with open(METADATA_PATH, "rb") as f:
         metadata_store = pickle.load(f)
 
@@ -94,11 +65,9 @@ def startup_load_resources():
             tokenized_docs = pickle.load(f)
     else:
         tokenized_docs = [cu.tokenize(d) for d in doc_texts]
+    
+    # Sirf BM25 initialize kar rahe hain, No AI embeddings
     bm25 = cu.BM25(tokenized_docs)
-
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    retriever = HybridRetriever(metadata_store, doc_texts, embedding_model, vector_index, bm25)
 
     url_index = {r["url"].strip().rstrip("/").lower(): r for r in metadata_store if r["url"]}
     name_index = {r["name"].strip().lower(): r for r in metadata_store}
@@ -110,16 +79,13 @@ class Message(BaseModel):
     role: str
     content: str
 
-
 class ChatRequest(BaseModel):
     messages: List[Message]
-
 
 class RecommendationItem(BaseModel):
     name: str
     url: str
     test_type: str
-
 
 class ChatResponse(BaseModel):
     reply: str
@@ -145,10 +111,6 @@ def format_context_block(rec: dict) -> str:
 
 
 def resolve_against_catalog(item: dict):
-    """Reconcile one LLM-proposed recommendation against the authoritative
-    catalog. Returns a corrected dict or None if it can't be matched to a
-    real catalog item (in which case it must be dropped — recommending
-    something outside the catalog fails the hard eval)."""
     url = (item.get("url") or "").strip().rstrip("/").lower()
     name = (item.get("name") or "").strip().lower()
 
@@ -171,10 +133,6 @@ def validate_recommendations(raw_recs) -> list:
     for item in raw_recs or []:
         fixed = resolve_against_catalog(item)
         if fixed is None:
-            # Previously silent. If a run comes back with recommendations: []
-            # but the LLM actually proposed items, this is how you'll know
-            # they were dropped here (fuzzy-match miss) rather than never
-            # generated in the first place.
             logger.warning("Dropped unresolvable recommendation from LLM output: %r", item)
             continue
         if fixed["url"] in seen_urls:
@@ -231,46 +189,13 @@ OUTPUT STRICT JSON matching this schema exactly:
 recommendations must be [] when still gathering context or refusing, otherwise 1-10 items copied verbatim (name/url/test_type) from CATALOG CONTEXT.
 """
 
-
 GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role or skills?"
 
-# --- Token budget --------------------------------------------------------
-# Root cause found in the live run: openai/gpt-oss-120b's free tier is
-# capped at ~8,000 tokens per MINUTE (separate from, and much tighter than,
-# the 200K tokens/day cap already diagnosed). With the old
-# MAX_CONTEXT_CANDIDATES=25, each candidate's ~8-line metadata block, plus
-# a compiled_history that grows every turn (this API is stateless and
-# resends the full history each call), a SINGLE call on turn 4+ of a
-# multi-turn conversation could exceed 8K TPM by itself -- independent of
-# cumulative daily usage. That's why C1 (short) mostly worked, C10 (long)
-# went slow/failed, and C2-C9 (called right after) failed near-instantly:
-# the TPM window was already blown before they even started.
-#
-# Fix has two parts: (1) shrink prompt tokens per call, (2) prefer a
-# cheaper/higher-throughput model for iteration and reserve the larger one
-# for final verification. Both are configurable via env vars so you can
-# tune against your actual account limits (check
-# https://console.groq.com/settings/limits) without editing code.
 MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "10"))
 CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "160"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-
-# If a long, multi-turn conversation still risks a large prompt, cap
-# compiled_history to the most recent turns rather than resending every
-# turn ever exchanged -- keeps token cost bounded instead of growing
-# linearly with conversation length. Set to 0 to disable.
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "12"))
-
-# Attempts for the LLM call stage: 1 initial + this many retries, and only for
-# error types where retrying can plausibly help (rate limits, timeouts,
-# transient connection/server errors, and one-off malformed JSON output).
 MAX_LLM_RETRIES = 2
-
-# If Groq's rate-limit error reports a wait time at or beyond this many
-# seconds, retrying within this request is pointless (the response would
-# still be waiting when the eval harness's own 30s budget expires) -- fail
-# fast with a clear log line instead of burning the retry loop on a call
-# that's mathematically guaranteed to fail again.
 RATE_LIMIT_RETRY_AFTER_GIVE_UP_S = 25
 _RETRY_AFTER_RE = re.compile(r"try again in (\d+)m|try again in ([\d.]+)s", re.IGNORECASE)
 
@@ -286,19 +211,13 @@ def _parse_retry_after_seconds(message: str):
         return float(seconds)
     return None
 
-
 def _fallback_response(stage: str, error: Exception) -> ChatResponse:
     logger.error("Falling back after failure in stage=%s: %s\n%s", stage, error, traceback.format_exc())
     return ChatResponse(reply=GENERIC_FALLBACK_REPLY, recommendations=[], end_of_conversation=False)
 
-
 def build_compiled_history(messages) -> str:
     msgs = list(messages)
     if MAX_HISTORY_TURNS and len(msgs) > MAX_HISTORY_TURNS:
-        # Keep the first turn (often carries the original role/JD context)
-        # plus the most recent turns, dropping the noisy middle rather than
-        # truncating individual messages -- this bounds token growth on
-        # long conversations without losing the initial ask.
         kept = [msgs[0]] + msgs[-(MAX_HISTORY_TURNS - 1):]
         omitted = len(msgs) - len(kept)
         lines = [f"{msgs[0].role.upper()}: {msgs[0].content}", f"[...{omitted} earlier turns omitted for length...]"]
@@ -314,17 +233,19 @@ def execute_agent(payload: ChatRequest):
 
     compiled_history = build_compiled_history(payload.messages)
 
-    # --- Stage 1: retrieval -----------------------------------------------
-    # Broken out on its own so a bug here (e.g. in retrieval.py) is logged as
-    # exactly that, rather than being indistinguishable from a Groq failure.
-    # It's also the explanation for near-instant empty responses: a retrieval
-    # exception fails *before* any network call to Groq is ever made, so if
-    # this is what's happening, the fast latency isn't a Groq symptom at all.
+    # --- Stage 1: retrieval (BM25 Only) -----------------------------------
     retrieved_context = "No catalog data found."
-    if retriever is not None:
+    if bm25 is not None:
         try:
-            messages_dicts = [{"role": m.role, "content": m.content} for m in payload.messages]
-            candidates = retriever.retrieve(messages_dicts)[:MAX_CONTEXT_CANDIDATES]
+            # User ki aakhiri query nikal kar BM25 me bhej rahe hain
+            last_user_msg = next((m.content for m in reversed(payload.messages) if m.role == "user"), "")
+            tokenized_query = cu.tokenize(last_user_msg)
+            
+            # BM25 se scores nikal kar top candidates fetch kar rahe hain
+            scores = bm25.get_scores(tokenized_query)
+            scored_candidates = sorted(zip(scores, metadata_store), key=lambda x: x[0], reverse=True)
+            candidates = [doc for score, doc in scored_candidates[:MAX_CONTEXT_CANDIDATES] if score > 0]
+            
             retrieved_context = "\n\n".join(format_context_block(r) for r in candidates) or "No catalog matches found."
         except Exception as e:
             return _fallback_response("retrieval", e)
@@ -345,16 +266,13 @@ def execute_agent(payload: ChatRequest):
                 model=GROQ_MODEL,
                 response_format={"type": "json_object"},
                 max_tokens=2048,
-                temperature=0.2,  # consistency/precision matter more here than variety
+                temperature=0.2, 
             )
             raw_content = chat_completion.choices[0].message.content
             response_json = json.loads(raw_content)
             break
 
         except AuthenticationError as e:
-            # A bad/missing key will never succeed on retry -- fail fast and
-            # loud instead of burning the retry budget (and eval's latency
-            # budget) on three guaranteed-identical 401s.
             logger.error("Groq authentication failed on attempt %d -- check GROQ_API_KEY: %s", attempt, e)
             last_error = e
             break
@@ -363,12 +281,6 @@ def execute_agent(payload: ChatRequest):
             last_error = e
             retry_after = _parse_retry_after_seconds(str(e))
             if retry_after is not None and retry_after >= RATE_LIMIT_RETRY_AFTER_GIVE_UP_S:
-                # Groq itself is telling us this won't clear for a while
-                # (this is the daily-quota-exhaustion shape, not a
-                # transient burst) -- retrying 1s/2s/4s later is
-                # guaranteed to hit the exact same wall. Fail fast and
-                # loud instead of quietly wasting the request's latency
-                # budget on doomed attempts.
                 logger.error(
                     "Groq rate limit (429) on attempt %d reports a %.0fs wait -- "
                     "giving up immediately rather than retrying a call that can't "
@@ -376,7 +288,7 @@ def execute_agent(payload: ChatRequest):
                     attempt, retry_after, e,
                 )
                 break
-            wait_s = 2 ** (attempt - 1)  # 1s, 2s, 4s
+            wait_s = 2 ** (attempt - 1)  
             logger.warning(
                 "Groq rate limit (429) on attempt %d/%d: %s -- backing off %ss",
                 attempt, MAX_LLM_RETRIES + 1, e, wait_s,
@@ -411,24 +323,11 @@ def execute_agent(payload: ChatRequest):
 
     # --- Stage 3: post-processing / validation -----------------------------
     try:
-        # The LLM can legitimately return `"recommendations": null` (the
-        # sample conversations document this as valid behavior for
-        # no-recommendation turns). List[RecommendationItem] does not
-        # accept None, so without this normalization Pydantic raises and
-        # the request silently falls into the generic exception fallback
-        # below -- which is exactly what was happening on vague first
-        # turns before this fix.
         if response_json.get("recommendations") is None:
             response_json["recommendations"] = []
         response_json.setdefault("reply", "")
         response_json.setdefault("end_of_conversation", False)
 
-        # Post-generation validation: never trust the LLM's name/url/test_type
-        # verbatim. Reconcile every recommendation against the authoritative
-        # catalog; drop anything that can't be matched (hard-eval requires
-        # catalog-only recommendations), and overwrite metadata fields with
-        # the authoritative source so duration/test_type can never be
-        # hallucinated even if the LLM output them incorrectly.
         response_json["recommendations"] = validate_recommendations(response_json.get("recommendations"))
 
         return ChatResponse(**response_json)
