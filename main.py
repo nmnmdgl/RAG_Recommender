@@ -243,7 +243,7 @@ def execute_agent(payload: ChatRequest):
             tokenized_query = cu.tokenize(last_user_msg)
             
             # BM25 se scores nikal kar top candidates fetch kar rahe hain
-            scores = bm25.get_scores(tokenized_query)
+            scores = bm25.score(tokenized_query)
             scored_candidates = sorted(zip(scores, metadata_store), key=lambda x: x[0], reverse=True)
             candidates = [doc for score, doc in scored_candidates[:MAX_CONTEXT_CANDIDATES] if score > 0]
             
