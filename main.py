@@ -20,6 +20,7 @@ from groq import (
 )
 
 import catalog_utils as cu
+from retrieval import decompose_query 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +48,7 @@ name_index = {}
 @app.on_event("startup")
 def startup_load_resources():
     global bm25, metadata_store, url_index, name_index
-    print("⏳ System startup: Loading BM25 retrieval resources (Lightweight Mode)...")
+    print("⏳ System startup: Loading BM25 retrieval resources (Smart Hybrid Mode)...")
 
     if not os.path.exists(METADATA_PATH):
         print("⚠️ Warning: Metadata file missing. Run build_index.py first.")
@@ -125,7 +126,6 @@ def validate_recommendations(raw_recs) -> list:
     for item in raw_recs or []:
         fixed = resolve_against_catalog(item)
         if fixed is None:
-            logger.warning("Dropped unresolvable recommendation from LLM output: %r", item)
             continue
         if fixed["url"] in seen_urls:
             continue
@@ -222,23 +222,47 @@ def execute_agent(payload: ChatRequest):
 
     compiled_history = build_compiled_history(payload.messages)
 
-    # --- Stage 1: retrieval (BM25 with Full User Context & Expanded Window) ---
+    # --- Stage 1: Smart Retrieval (Facet Split + RRF Fusion + Alias Anchoring) ---
     retrieved_context = "No catalog data found."
     if bm25 is not None:
         try:
-            # Full context combine kiya jisse Llama ko saare keywords yaad rahein
-            user_messages = [m.content for m in payload.messages if m.role == "user"]
-            full_user_text = " ".join(user_messages)
-            latest_user_text = user_messages[-1] if user_messages else ""
+            # 🚀 NAYI CHEEZ: retrieval.py ka logic call ho raha hai!
+            # Format dictionaries properly for decompose_query
+            formatted_msgs = [{"role": m.role, "content": m.content} for m in payload.messages]
+            decomposed = decompose_query(formatted_msgs)
             
-            tokenized_query = cu.tokenize(full_user_text) + cu.tokenize(latest_user_text)
+            facets = decomposed.get("facets", [])
+            target_k = min(40, max(18, 18 + 2 * len(facets)))
             
-            scores = bm25.get_scores(tokenized_query)
-            scored_candidates = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
-            candidate_indices = [idx for score, idx in scored_candidates[:15] if score > 0]
-            
-            # History anchoring: Purane tests ko jabardasti context me daalna taaki FLAP na ho
-            full_history_text = " ".join(m.content.lower() for m in payload.messages)
+            def rank_lexical(query: str, k: int):
+                tokens = cu.tokenize(query)
+                if not tokens: return []
+                scores = bm25.get_scores(tokens) if hasattr(bm25, 'get_scores') else bm25.score(tokens)
+                scored = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
+                return [idx for s, idx in scored[:k] if s > 0]
+
+            ranked_lists = []
+            facet_top_hits = []
+
+            # 1. Base queries search
+            for q in decomposed.get("queries", []):
+                ranked_lists.append(rank_lexical(q, 15))
+
+            # 2. Facet-specific search (Taaki Docker/AWS chhut na jaye)
+            for facet in facets:
+                l = rank_lexical(facet, 10)
+                ranked_lists.append(l)
+                if l:
+                    for i in l[:2]:
+                        if i not in facet_top_hits:
+                            facet_top_hits.append(i)
+
+            # 3. Reciprocal Rank Fusion (Sab lists ko mila ke smart ranking)
+            fused = cu.reciprocal_rank_fusion([r for r in ranked_lists if r])
+            ordered = sorted(fused.keys(), key=lambda i: fused[i], reverse=True)
+
+            # 4. Strict Alias Anchoring (Taki 'G+', 'OPQ' drop na hon)
+            full_history_text = decomposed.get("full_conversation_text", "").lower()
             alias_hits = cu.extract_alias_hits(full_history_text)
             
             forced_indices = []
@@ -247,17 +271,21 @@ def execute_agent(payload: ChatRequest):
                     if hint in rec["name"].lower() and i not in forced_indices:
                         forced_indices.append(i)
                         
+            for i in facet_top_hits:
+                if i not in forced_indices:
+                    forced_indices.append(i)
+
             for i, rec in enumerate(metadata_store):
                 name_lower = rec["name"].lower()
                 core_lower = cu.core_name(name_lower)
-                if ((len(name_lower) > 5 and name_lower in full_history_text) or 
-                    (len(core_lower) > 5 and core_lower in full_history_text)):
-                    if i not in forced_indices:
-                        forced_indices.append(i)
+                matched = (len(name_lower) > 5 and name_lower in full_history_text) or \
+                          (len(core_lower) > 5 and core_lower in full_history_text)
+                if matched and i not in forced_indices:
+                    forced_indices.append(i)
 
-            # Final candidate list
-            final_indices = forced_indices + [i for i in candidate_indices if i not in forced_indices]
-            final_indices = final_indices[:20] 
+            # Final Combination
+            final_indices = forced_indices + [i for i in ordered if i not in forced_indices]
+            final_indices = final_indices[:target_k]
             
             candidates = [metadata_store[i] for i in final_indices]
             retrieved_context = "\n\n".join(format_context_block(r) for r in candidates) or "No catalog matches found."
