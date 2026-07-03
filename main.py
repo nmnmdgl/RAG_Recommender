@@ -214,6 +214,7 @@ def build_compiled_history(messages) -> str:
         return "\n".join(lines) + "\n"
     return "".join(f"{msg.role.upper()}: {msg.content}\n" for msg in msgs)
 
+
 @app.post("/chat", response_model=ChatResponse)
 def execute_agent(payload: ChatRequest):
     if not payload.messages:
@@ -225,16 +226,18 @@ def execute_agent(payload: ChatRequest):
     retrieved_context = "No catalog data found."
     if bm25 is not None:
         try:
+            # Full context combine kiya jisse Llama ko saare keywords yaad rahein
             user_messages = [m.content for m in payload.messages if m.role == "user"]
             full_user_text = " ".join(user_messages)
             latest_user_text = user_messages[-1] if user_messages else ""
             
             tokenized_query = cu.tokenize(full_user_text) + cu.tokenize(latest_user_text)
             
-            scores = bm25.score(tokenized_query)
+            scores = bm25.get_scores(tokenized_query)
             scored_candidates = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
             candidate_indices = [idx for score, idx in scored_candidates[:15] if score > 0]
             
+            # History anchoring: Purane tests ko jabardasti context me daalna taaki FLAP na ho
             full_history_text = " ".join(m.content.lower() for m in payload.messages)
             alias_hits = cu.extract_alias_hits(full_history_text)
             
@@ -252,6 +255,7 @@ def execute_agent(payload: ChatRequest):
                     if i not in forced_indices:
                         forced_indices.append(i)
 
+            # Final candidate list
             final_indices = forced_indices + [i for i in candidate_indices if i not in forced_indices]
             final_indices = final_indices[:20] 
             
