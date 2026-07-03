@@ -223,18 +223,21 @@ def execute_agent(payload: ChatRequest):
 
     compiled_history = build_compiled_history(payload.messages)
 
-    # --- Stage 1: retrieval (BM25 + HISTORY ANCHORING FIX) ----------------
+    # --- Stage 1: retrieval (BM25 with Full User Context & Expanded Window) ---
     retrieved_context = "No catalog data found."
     if bm25 is not None:
         try:
-            last_user_msg = next((m.content for m in reversed(payload.messages) if m.role == "user"), "")
-            tokenized_query = cu.tokenize(last_user_msg)
+            user_messages = [m.content for m in payload.messages if m.role == "user"]
+            full_user_text = " ".join(user_messages)
+            latest_user_text = user_messages[-1] if user_messages else ""
+            
+            tokenized_query = cu.tokenize(full_user_text) + cu.tokenize(latest_user_text)
             
             scores = bm25.score(tokenized_query)
             scored_candidates = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
-            candidate_indices = [idx for score, idx in scored_candidates[:MAX_CONTEXT_CANDIDATES] if score > 0]
             
-            # 🚀 FLAP FIX: Extract previous names & aliases to force them into the context
+            candidate_indices = [idx for score, idx in scored_candidates[:15] if score > 0]
+            
             full_history_text = " ".join(m.content.lower() for m in payload.messages)
             alias_hits = cu.extract_alias_hits(full_history_text)
             
@@ -253,18 +256,14 @@ def execute_agent(payload: ChatRequest):
                         forced_indices.append(i)
 
             final_indices = forced_indices + [i for i in candidate_indices if i not in forced_indices]
-            final_indices = final_indices[:MAX_CONTEXT_CANDIDATES + 4]
+            final_indices = final_indices[:20] # Max 20 candidates in context
             
             candidates = [metadata_store[i] for i in final_indices]
-            
             retrieved_context = "\n\n".join(format_context_block(r) for r in candidates) or "No catalog matches found."
         except Exception as e:
             return _fallback_response("retrieval", e)
-
-    agent_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        retrieved_context=retrieved_context, compiled_history=compiled_history
-    )
-
+    retrieved_context = "No catalog data found."
+    
     # --- Stage 2: LLM call + JSON parse ------------------------------------
     response_json = None
     last_error: Optional[Exception] = None
