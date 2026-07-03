@@ -100,7 +100,7 @@ def format_context_block(rec: dict) -> str:
         f"  TestType: {rec['test_type'] or '—'}\n"
         f"  Duration: {rec['duration'] or '—'}\n"
         f"  Languages: {langs}\n"
-        f"  Desc: {rec['description'][:CONTEXT_DESC_CHARS]}"
+        f"  Desc: {rec['description'][:100]}"
     )
 
 def resolve_against_catalog(item: dict):
@@ -182,9 +182,7 @@ recommendations must be [] when still gathering context or refusing, otherwise 1
 
 GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role or skills?"
 
-MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "4")) 
-CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "100"))
-MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4")) 
+MAX_HISTORY_TURNS = 4
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 MAX_LLM_RETRIES = 2
@@ -235,7 +233,6 @@ def execute_agent(payload: ChatRequest):
             
             scores = bm25.score(tokenized_query)
             scored_candidates = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
-            
             candidate_indices = [idx for score, idx in scored_candidates[:15] if score > 0]
             
             full_history_text = " ".join(m.content.lower() for m in payload.messages)
@@ -256,14 +253,17 @@ def execute_agent(payload: ChatRequest):
                         forced_indices.append(i)
 
             final_indices = forced_indices + [i for i in candidate_indices if i not in forced_indices]
-            final_indices = final_indices[:20] # Max 20 candidates in context
+            final_indices = final_indices[:20] 
             
             candidates = [metadata_store[i] for i in final_indices]
             retrieved_context = "\n\n".join(format_context_block(r) for r in candidates) or "No catalog matches found."
         except Exception as e:
             return _fallback_response("retrieval", e)
-    retrieved_context = "No catalog data found."
-    
+
+    agent_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        retrieved_context=retrieved_context, compiled_history=compiled_history
+    )
+
     # --- Stage 2: LLM call + JSON parse ------------------------------------
     response_json = None
     last_error: Optional[Exception] = None
