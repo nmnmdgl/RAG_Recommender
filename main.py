@@ -7,6 +7,7 @@ import logging
 import difflib
 import traceback
 from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from groq import (
@@ -17,6 +18,7 @@ from groq import (
     APIConnectionError,
     APIStatusError,
 )
+
 import catalog_utils as cu
 
 logging.basicConfig(
@@ -30,10 +32,7 @@ app = FastAPI(title="SHL Recommender API")
 
 _groq_api_key = os.environ.get("GROQ_API_KEY")
 if not _groq_api_key:
-    logger.error(
-        "GROQ_API_KEY is not set in the environment. Every /chat call will "
-        "fail authentication until this is fixed."
-    )
+    logger.error("GROQ_API_KEY is not set in the environment.")
 
 client = Groq(api_key=_groq_api_key or "dummy_key", timeout=20.0, max_retries=0)
 
@@ -44,7 +43,6 @@ bm25 = None
 metadata_store = None
 url_index = {}
 name_index = {}
-
 
 @app.on_event("startup")
 def startup_load_resources():
@@ -66,14 +64,12 @@ def startup_load_resources():
     else:
         tokenized_docs = [cu.tokenize(d) for d in doc_texts]
     
-    # Sirf BM25 initialize kar rahe hain, No AI embeddings
     bm25 = cu.BM25(tokenized_docs)
 
     url_index = {r["url"].strip().rstrip("/").lower(): r for r in metadata_store if r["url"]}
     name_index = {r["name"].strip().lower(): r for r in metadata_store}
 
     print(f"🎯 Loaded {len(metadata_store)} catalog items. API is ready.")
-
 
 class Message(BaseModel):
     role: str
@@ -92,11 +88,9 @@ class ChatResponse(BaseModel):
     recommendations: List[RecommendationItem] = Field(default_factory=list)
     end_of_conversation: bool
 
-
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
-
 
 def format_context_block(rec: dict) -> str:
     langs = ", ".join(rec["languages"][:3]) or "—"
@@ -108,7 +102,6 @@ def format_context_block(rec: dict) -> str:
         f"  Languages: {langs}\n"
         f"  Desc: {rec['description'][:CONTEXT_DESC_CHARS]}"
     )
-
 
 def resolve_against_catalog(item: dict):
     url = (item.get("url") or "").strip().rstrip("/").lower()
@@ -126,7 +119,6 @@ def resolve_against_catalog(item: dict):
 
     return {"name": rec["name"], "url": rec["url"], "test_type": rec["test_type"] or item.get("test_type", "")}
 
-
 def validate_recommendations(raw_recs) -> list:
     resolved = []
     seen_urls = set()
@@ -140,7 +132,6 @@ def validate_recommendations(raw_recs) -> list:
         seen_urls.add(fixed["url"])
         resolved.append(fixed)
     return resolved[:10]
-
 
 SYSTEM_PROMPT_TEMPLATE = """You are an expert SHL Assessment Consultant.
 Your goal is to recommend the best SHL assessments based on the user's request, grounded ONLY in the CATALOG CONTEXT below. Never invent a test, URL, duration, or language that is not present in the context.
@@ -194,12 +185,11 @@ GENERIC_FALLBACK_REPLY = "Could you provide more specific details about the role
 MAX_CONTEXT_CANDIDATES = int(os.environ.get("MAX_CONTEXT_CANDIDATES", "4")) 
 CONTEXT_DESC_CHARS = int(os.environ.get("CONTEXT_DESC_CHARS", "100"))
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4")) 
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 MAX_LLM_RETRIES = 2
 RATE_LIMIT_RETRY_AFTER_GIVE_UP_S = 25
 _RETRY_AFTER_RE = re.compile(r"try again in (\d+)m|try again in ([\d.]+)s", re.IGNORECASE)
-
 
 def _parse_retry_after_seconds(message: str):
     m = _RETRY_AFTER_RE.search(message or "")
@@ -226,7 +216,6 @@ def build_compiled_history(messages) -> str:
         return "\n".join(lines) + "\n"
     return "".join(f"{msg.role.upper()}: {msg.content}\n" for msg in msgs)
 
-
 @app.post("/chat", response_model=ChatResponse)
 def execute_agent(payload: ChatRequest):
     if not payload.messages:
@@ -234,18 +223,39 @@ def execute_agent(payload: ChatRequest):
 
     compiled_history = build_compiled_history(payload.messages)
 
-    # --- Stage 1: retrieval (BM25 Only) -----------------------------------
+    # --- Stage 1: retrieval (BM25 + HISTORY ANCHORING FIX) ----------------
     retrieved_context = "No catalog data found."
     if bm25 is not None:
         try:
-            # User ki aakhiri query nikal kar BM25 me bhej rahe hain
             last_user_msg = next((m.content for m in reversed(payload.messages) if m.role == "user"), "")
             tokenized_query = cu.tokenize(last_user_msg)
             
-            # BM25 se scores nikal kar top candidates fetch kar rahe hain
             scores = bm25.score(tokenized_query)
-            scored_candidates = sorted(zip(scores, metadata_store), key=lambda x: x[0], reverse=True)
-            candidates = [doc for score, doc in scored_candidates[:MAX_CONTEXT_CANDIDATES] if score > 0]
+            scored_candidates = sorted(zip(scores, range(len(metadata_store))), key=lambda x: x[0], reverse=True)
+            candidate_indices = [idx for score, idx in scored_candidates[:MAX_CONTEXT_CANDIDATES] if score > 0]
+            
+            # 🚀 FLAP FIX: Extract previous names & aliases to force them into the context
+            full_history_text = " ".join(m.content.lower() for m in payload.messages)
+            alias_hits = cu.extract_alias_hits(full_history_text)
+            
+            forced_indices = []
+            for hint in alias_hits:
+                for i, rec in enumerate(metadata_store):
+                    if hint in rec["name"].lower() and i not in forced_indices:
+                        forced_indices.append(i)
+                        
+            for i, rec in enumerate(metadata_store):
+                name_lower = rec["name"].lower()
+                core_lower = cu.core_name(name_lower)
+                if ((len(name_lower) > 5 and name_lower in full_history_text) or 
+                    (len(core_lower) > 5 and core_lower in full_history_text)):
+                    if i not in forced_indices:
+                        forced_indices.append(i)
+
+            final_indices = forced_indices + [i for i in candidate_indices if i not in forced_indices]
+            final_indices = final_indices[:MAX_CONTEXT_CANDIDATES + 4]
+            
+            candidates = [metadata_store[i] for i in final_indices]
             
             retrieved_context = "\n\n".join(format_context_block(r) for r in candidates) or "No catalog matches found."
         except Exception as e:
@@ -282,45 +292,23 @@ def execute_agent(payload: ChatRequest):
             last_error = e
             retry_after = _parse_retry_after_seconds(str(e))
             if retry_after is not None and retry_after >= RATE_LIMIT_RETRY_AFTER_GIVE_UP_S:
-                logger.error(
-                    "Groq rate limit (429) on attempt %d reports a %.0fs wait -- "
-                    "giving up immediately rather than retrying a call that can't "
-                    "succeed yet. Check https://console.groq.com/settings/limits. %s",
-                    attempt, retry_after, e,
-                )
+                logger.error("Rate limit reached. Giving up. %s", e)
                 break
             wait_s = 2 ** (attempt - 1)  
-            logger.warning(
-                "Groq rate limit (429) on attempt %d/%d: %s -- backing off %ss",
-                attempt, MAX_LLM_RETRIES + 1, e, wait_s,
-            )
             if attempt <= MAX_LLM_RETRIES:
                 time.sleep(wait_s)
 
         except APITimeoutError as e:
             last_error = e
-            logger.warning("Groq request timed out on attempt %d/%d: %s", attempt, MAX_LLM_RETRIES + 1, e)
-
         except APIConnectionError as e:
             last_error = e
-            logger.warning("Could not reach Groq on attempt %d/%d: %s", attempt, MAX_LLM_RETRIES + 1, e)
-
         except APIStatusError as e:
             last_error = e
-            logger.warning(
-                "Groq returned HTTP %s on attempt %d/%d: %s",
-                getattr(e, "status_code", "?"), attempt, MAX_LLM_RETRIES + 1, e,
-            )
-
         except json.JSONDecodeError as e:
             last_error = e
-            logger.warning(
-                "Model output wasn't valid JSON on attempt %d/%d: %s | raw (first 500 chars): %.500s",
-                attempt, MAX_LLM_RETRIES + 1, e, raw_content,
-            )
 
     if response_json is None:
-        return _fallback_response("llm-call", last_error or RuntimeError("no response and no error captured"))
+        return _fallback_response("llm-call", last_error or RuntimeError("no response"))
 
     # --- Stage 3: post-processing / validation -----------------------------
     try:

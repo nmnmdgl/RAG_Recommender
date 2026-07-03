@@ -4,7 +4,7 @@ import requests
 import time
 import os
 
-LOCAL_API_URL = "http://127.0.0.1:8000/chat"
+LOCAL_API_URL = "https://shl-recommender-naman.onrender.com/chat"
 LATENCY_BUDGET_SECONDS = 30  # from the assignment's own cap
 
 
@@ -137,7 +137,7 @@ def run_local_evaluation():
                 time.sleep(5) # Small pause to avoid overwhelming the Groq API
             print("\n")
 
-            time.sleep(15)  # Pause between traces to avoid overwhelming the API
+            time.sleep(65)  # Pause between traces to avoid overwhelming the API
 
             if not connection_failed:
                 recall, precision = score(gold, last_names)
